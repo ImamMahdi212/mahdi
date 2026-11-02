@@ -4,15 +4,22 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const logger = require('./logger');
 
+// Columnas del tablero de ventas. "Etapa" la puede editar el equipo a mano:
+// el bot lee ese cambio y mueve al lead en el embudo.
 const HEADERS = [
   'Fecha',
   'Telefono',
   'Nombre',
+  'Etapa',
+  'Estado',
+  'Temperatura',
   'Presupuesto',
   'TipoCredito',
   'FechaVisita',
   'Interes',
-  'Estado',
+  'Seguimientos',
+  'ProximoSeguimiento',
+  'UltimoMensaje',
   'Notas',
   'UltimaActualizacion',
 ];
@@ -99,48 +106,71 @@ async function withRetry(fn, attempts = 3) {
   throw lastErr;
 }
 
-// Serializa escrituras para evitar duplicados por condiciones de carrera.
-let writeChain = Promise.resolve();
+// Serializa los accesos a la hoja para evitar filas duplicadas.
+let chain = Promise.resolve();
+function serialized(fn) {
+  const task = chain.then(() => withRetry(fn));
+  chain = task.catch(() => {});
+  return task;
+}
+
+const clean = (v) => (v === null || v === undefined ? '' : String(v));
 
 /**
- * Inserta o actualiza (por teléfono) un lead en Google Sheets.
- * @param {object} lead
- * @returns {Promise<{action: 'created'|'updated'}>}
+ * Inserta o actualiza (por teléfono) varios leads del embudo.
+ * @param {Array<object>} leads
  */
-function saveLead(lead) {
-  const task = writeChain.then(() =>
-    withRetry(async () => {
-      const sheet = await getSheet();
-      const telefono = String(lead.telefono || '').trim();
+function syncLeads(leads) {
+  return serialized(async () => {
+    const sheet = await getSheet();
+    const rows = await sheet.getRows();
+    const byPhone = new Map(rows.map((r) => [String(r.get('Telefono') || '').replace(/\D/g, ''), r]));
+    const toAdd = [];
+
+    for (const lead of leads) {
+      const telefono = String(lead.telefono || '').replace(/\D/g, '');
+      if (!telefono) continue;
       const data = {
         Telefono: telefono,
-        Nombre: lead.nombre || '',
-        Presupuesto: lead.presupuesto || '',
-        TipoCredito: lead.tipo_credito || '',
-        FechaVisita: lead.fecha_visita || '',
-        Interes: lead.interes || '',
-        Estado: lead.estado || '',
-        Notas: lead.notas || '',
+        Nombre: clean(lead.nombre),
+        Etapa: clean(lead.etapa),
+        Estado: clean(lead.calificacion),
+        Temperatura: clean(lead.temperatura),
+        Presupuesto: clean(lead.presupuesto),
+        TipoCredito: clean(lead.tipo_credito),
+        FechaVisita: clean(lead.fecha_visita),
+        Interes: clean(lead.interes),
+        Seguimientos: clean(lead.seguimientos),
+        ProximoSeguimiento: clean(lead.proximo_seguimiento),
+        UltimoMensaje: clean(lead.ultimo_mensaje),
+        Notas: clean(lead.notas),
         UltimaActualizacion: now(),
       };
-
-      const rows = await sheet.getRows();
-      const existing = rows.find((r) => String(r.get('Telefono') || '').trim() === telefono);
-
+      const existing = byPhone.get(telefono);
       if (existing) {
         existing.assign(data);
         await existing.save();
-        logger.info('Lead actualizado en CRM', { telefono, estado: data.Estado });
-        return { action: 'updated' };
+      } else {
+        toAdd.push({ Fecha: lead.creado || now(), ...data });
       }
+    }
+    if (toAdd.length) await sheet.addRows(toAdd);
+    logger.debug('Embudo sincronizado con Google Sheets', { actualizados: leads.length - toAdd.length, nuevos: toAdd.length });
+  });
+}
 
-      await sheet.addRow({ Fecha: now(), ...data });
-      logger.info('Lead creado en CRM', { telefono, estado: data.Estado });
-      return { action: 'created' };
-    })
-  );
-  writeChain = task.catch(() => {});
-  return task;
+/** Lee la columna Etapa de la hoja (para detectar cambios hechos por el equipo). */
+function readEtapas() {
+  return serialized(async () => {
+    const sheet = await getSheet();
+    const rows = await sheet.getRows();
+    return rows
+      .map((r) => ({
+        telefono: String(r.get('Telefono') || '').replace(/\D/g, ''),
+        etapa: String(r.get('Etapa') || '').trim(),
+      }))
+      .filter((r) => r.telefono);
+  });
 }
 
 async function healthCheck() {
@@ -153,4 +183,4 @@ async function healthCheck() {
   }
 }
 
-module.exports = { saveLead, healthCheck, isConfigured, getSheet };
+module.exports = { syncLeads, readEtapas, healthCheck, isConfigured, getSheet };

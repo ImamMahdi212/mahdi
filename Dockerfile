@@ -14,7 +14,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY . .
 
-RUN mkdir -p /app/.wwebjs_auth /app/.wwebjs_cache /app/logs && chown -R node:node /app
+RUN mkdir -p /app/.wwebjs_auth /app/.wwebjs_cache /app/logs /app/data && chown -R node:node /app
 USER node
 
 EXPOSE 3000

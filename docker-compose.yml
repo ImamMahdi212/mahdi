@@ -11,6 +11,7 @@ services:
     volumes:
       - wwebjs_auth:/app/.wwebjs_auth
       - wwebjs_cache:/app/.wwebjs_cache
+      - bot_data:/app/data
       - ./logs:/app/logs
       - ./knowledge.md:/app/knowledge.md:ro
     shm_size: "1gb"
@@ -23,3 +24,4 @@ services:
 volumes:
   wwebjs_auth:
   wwebjs_cache:
+  bot_data:
