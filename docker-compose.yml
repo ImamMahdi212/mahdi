@@ -1,0 +1,25 @@
+services:
+  mone-gardens-bot:
+    build: .
+    container_name: mone-gardens-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - CHROME_PATH=/usr/bin/chromium
+    ports:
+      - "3000:3000"
+    volumes:
+      - wwebjs_auth:/app/.wwebjs_auth
+      - wwebjs_cache:/app/.wwebjs_cache
+      - ./logs:/app/logs
+      - ./knowledge.md:/app/knowledge.md:ro
+    shm_size: "1gb"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wwebjs_auth:
+  wwebjs_cache:

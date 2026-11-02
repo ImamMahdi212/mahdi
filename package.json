@@ -1,0 +1,37 @@
+{
+  "name": "mone-gardens-whatsapp-agent",
+  "version": "1.0.0",
+  "description": "Agente de WhatsApp (Sofía) para calificar leads de Moné Gardens y registrarlos en Google Sheets",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node --watch app.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "docker:up": "docker compose up -d --build",
+    "docker:logs": "docker compose logs -f"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ImamMahdi212/mahdi.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/ImamMahdi212/mahdi/issues"
+  },
+  "homepage": "https://github.com/ImamMahdi212/mahdi#readme",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "google-auth-library": "^11.3.2",
+    "google-spreadsheet": "^5.3.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.34.7",
+    "winston": "^3.19.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
