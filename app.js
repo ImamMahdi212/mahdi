@@ -12,14 +12,22 @@ const crm = require('./crm');
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const DEBOUNCE_MS = parseInt(process.env.MESSAGE_DEBOUNCE_MS || '3500', 10);
 const SESSION_PATH = process.env.WWEBJS_SESSION_PATH || './.wwebjs_auth';
-const ALLOWED_NUMBERS = (process.env.ALLOWED_NUMBERS || '')
-  .split(',')
-  .map((n) => n.replace(/\D/g, ''))
-  .filter(Boolean);
+const parseNumbers = (v) =>
+  (v || '')
+    .split(',')
+    .map((n) => n.replace(/\D/g, ''))
+    .filter(Boolean);
+const ALLOWED_NUMBERS = parseNumbers(process.env.ALLOWED_NUMBERS);
+const ADVISOR_NUMBERS = parseNumbers(process.env.ADVISOR_NUMBERS);
+const NOTIFY_DISQUALIFIED = /^(1|true|si|sí|yes)$/i.test(process.env.NOTIFY_DISQUALIFIED || '');
+const TAKEOVER_MS = parseFloat(process.env.HUMAN_TAKEOVER_HOURS || '12') * 3600 * 1000;
 
 if (!process.env.ANTHROPIC_API_KEY) {
   logger.error('Falta ANTHROPIC_API_KEY en el .env');
   process.exit(1);
+}
+if (!ADVISOR_NUMBERS.length) {
+  logger.warn('ADVISOR_NUMBERS vacío: ningún asesor recibirá avisos de leads calificados');
 }
 if (!crm.isConfigured()) {
   logger.warn('Google Sheets no está configurado: los leads NO se guardarán hasta completar el .env');
@@ -84,6 +92,161 @@ client.on('disconnected', async (reason) => {
 });
 
 // ---------------------------------------------------------------------------
+// Envío de mensajes del bot (para distinguirlos de los que escribe un humano)
+// ---------------------------------------------------------------------------
+/** chatId -> textos que el bot está por enviar (para reconocer su eco en message_create) */
+const pendingBotEchoes = new Map();
+const ECHO_WINDOW_MS = 2 * 60 * 1000;
+
+function rememberBotMessage(chatId, text) {
+  const list = (pendingBotEchoes.get(chatId) || []).filter((e) => Date.now() - e.at < ECHO_WINDOW_MS);
+  list.push({ text: text.trim(), at: Date.now() });
+  pendingBotEchoes.set(chatId, list);
+}
+
+function consumeBotEcho(chatId, text) {
+  const list = pendingBotEchoes.get(chatId);
+  if (!list) return false;
+  const idx = list.findIndex((e) => e.text === (text || '').trim() && Date.now() - e.at < ECHO_WINDOW_MS);
+  if (idx === -1) return false;
+  list.splice(idx, 1);
+  if (!list.length) pendingBotEchoes.delete(chatId);
+  return true;
+}
+
+async function botSend(chatId, text) {
+  rememberBotMessage(chatId, text);
+  return client.sendMessage(chatId, text);
+}
+
+// ---------------------------------------------------------------------------
+// Pausa del bot cuando un asesor toma la conversación
+// ---------------------------------------------------------------------------
+/** phone -> timestamp hasta el que el bot no responde */
+const pausedUntil = new Map();
+/** chatId <-> phone de los leads que han escrito */
+const chatToPhone = new Map();
+const phoneToChat = new Map();
+
+function isPaused(phone) {
+  const until = pausedUntil.get(phone);
+  if (!until) return false;
+  if (Date.now() > until) {
+    pausedUntil.delete(phone);
+    logger.info('Pausa de asesor expirada; Sofía retoma el chat', { phone });
+    return false;
+  }
+  return true;
+}
+
+function pause(phone, ms, reason) {
+  pausedUntil.set(phone, Date.now() + ms);
+  const chatId = phoneToChat.get(phone);
+  const q = chatId && queues.get(chatId);
+  if (q && q.timer) {
+    clearTimeout(q.timer);
+    q.timer = null;
+    q.texts = [];
+  }
+  logger.info('Sofía pausada en este chat', { phone, reason, horas: +(ms / 3600000).toFixed(1) });
+}
+
+function resume(phone) {
+  pausedUntil.delete(phone);
+  logger.info('Sofía reactivada en este chat', { phone });
+}
+
+function fmtUntil(ts) {
+  return new Date(ts).toLocaleString('es-EC', { timeZone: process.env.TZ || 'America/Guayaquil', hour12: false });
+}
+
+// ---------------------------------------------------------------------------
+// Avisos al asesor
+// ---------------------------------------------------------------------------
+const advisorChatIds = new Map();
+
+async function advisorChatId(number) {
+  if (advisorChatIds.has(number)) return advisorChatIds.get(number);
+  const wid = await client.getNumberId(number);
+  if (!wid) throw new Error(`El número de asesor ${number} no tiene WhatsApp`);
+  advisorChatIds.set(number, wid._serialized);
+  return wid._serialized;
+}
+
+async function notifyAdvisors(text) {
+  await Promise.all(
+    ADVISOR_NUMBERS.map(async (number) => {
+      try {
+        await botSend(await advisorChatId(number), text);
+      } catch (err) {
+        logger.error('No se pudo avisar al asesor', { asesor: number, error: err.message });
+      }
+    })
+  );
+}
+
+ai.setLeadNotifier(async (lead) => {
+  if (!ADVISOR_NUMBERS.length) return;
+  const calificado = lead.estado === 'Calificado';
+  if (!calificado && !NOTIFY_DISQUALIFIED) return;
+
+  const titulo = calificado
+    ? lead.action === 'updated'
+      ? '🔄 *Lead actualizado – Moné Gardens*'
+      : '🔥 *Nuevo lead calificado – Moné Gardens*'
+    : '⚪ *Lead descalificado – Moné Gardens*';
+  const lines = [
+    titulo,
+    '',
+    `👤 ${lead.nombre || 'Sin nombre'}`,
+    `📱 +${lead.telefono}  →  https://wa.me/${lead.telefono}`,
+    `💰 ${[lead.presupuesto, lead.tipo_credito].filter(Boolean).join(' · ') || 'Sin dato'}`,
+    `📅 Visita: ${lead.fecha_visita || 'Sin fecha'}`,
+    `🏷️ ${lead.interes || '-'} · ${lead.estado}`,
+  ];
+  if (lead.notas) lines.push(`📝 ${lead.notas}`);
+  if (lead.action === 'error') lines.push('', '⚠️ No se pudo guardar en Google Sheets; revisa los logs.');
+  if (calificado) {
+    lines.push(
+      '',
+      'Si le escribes desde el número del bot, Sofía se pausa sola en ese chat.',
+      `Comandos (envíalos a este chat): /pausar ${lead.telefono} · /activar ${lead.telefono} · /estado`
+    );
+  }
+  await notifyAdvisors(lines.join('\n'));
+});
+
+// ---------------------------------------------------------------------------
+// Comandos de asesores (mensajes enviados al número del bot)
+// ---------------------------------------------------------------------------
+async function handleAdvisorCommand(msg, text) {
+  const [cmd, arg] = text.trim().split(/\s+/);
+  const phone = (arg || '').replace(/\D/g, '');
+  const reply = (t) => botSend(msg.from, t);
+
+  switch (cmd.toLowerCase()) {
+    case '/pausar':
+      if (!phone) return reply('Uso: /pausar 5939XXXXXXXX');
+      pause(phone, TAKEOVER_MS, 'comando de asesor');
+      return reply(`⏸️ Sofía pausada con +${phone} hasta ${fmtUntil(pausedUntil.get(phone))}.`);
+    case '/activar':
+      if (!phone) return reply('Uso: /activar 5939XXXXXXXX');
+      resume(phone);
+      return reply(`▶️ Sofía vuelve a atender a +${phone}.`);
+    case '/estado': {
+      const activos = [...pausedUntil.keys()].filter(isPaused);
+      return reply(
+        activos.length
+          ? `Chats pausados:\n${activos.map((p) => `• +${p} hasta ${fmtUntil(pausedUntil.get(p))}`).join('\n')}`
+          : 'No hay chats pausados. Sofía está atendiendo todos los chats.'
+      );
+    }
+    default:
+      return reply('Comandos: /pausar <número> · /activar <número> · /estado');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Procesamiento de mensajes: agrupa ráfagas y serializa por contacto
 // ---------------------------------------------------------------------------
 /** @type {Map<string, {texts: string[], timer: NodeJS.Timeout|null, chain: Promise<void>, msg: any, profileName: string, phone: string}>} */
@@ -101,6 +264,10 @@ async function resolvePhone(msg) {
   }
 }
 
+function isPrivateChat(id) {
+  return Boolean(id) && !id.endsWith('@g.us') && !id.endsWith('@broadcast') && !id.endsWith('@newsletter');
+}
+
 async function processBatch(chatId) {
   const q = queues.get(chatId);
   if (!q || !q.texts.length) return;
@@ -108,6 +275,11 @@ async function processBatch(chatId) {
   q.texts = [];
   q.timer = null;
   const { msg, phone, profileName } = q;
+
+  if (isPaused(phone)) {
+    ai.recordExternalMessage(phone, 'user', text);
+    return;
+  }
 
   let chat;
   try {
@@ -120,17 +292,19 @@ async function processBatch(chatId) {
   try {
     const started = Date.now();
     const reply = await ai.chat(phone, text, profileName);
-    await client.sendMessage(chatId, reply);
+    if (isPaused(phone)) {
+      // Un asesor tomó el chat mientras la IA pensaba: no enviar la respuesta.
+      logger.info('Respuesta descartada: un asesor tomó el chat', { phone });
+      return;
+    }
+    await botSend(chatId, reply);
     state.messagesProcessed++;
     state.lastMessageAt = new Date().toISOString();
     logger.info('Respuesta enviada', { phone, ms: Date.now() - started, in: text.slice(0, 200), out: reply.slice(0, 200) });
   } catch (err) {
     logger.error('Error procesando mensaje', { phone, error: err.message, stack: err.stack });
     try {
-      await client.sendMessage(
-        chatId,
-        'Disculpa, tuve un inconveniente técnico. ¿Podrías escribirme nuevamente en un momento? 🙏'
-      );
+      await botSend(chatId, 'Disculpa, tuve un inconveniente técnico. ¿Podrías escribirme nuevamente en un momento? 🙏');
     } catch (_) {
       /* ignorar */
     }
@@ -147,10 +321,21 @@ client.on('message', async (msg) => {
   try {
     if (msg.fromMe || msg.isStatus) return;
     const from = msg.from || '';
-    if (from.endsWith('@g.us') || from.endsWith('@broadcast') || from.endsWith('@newsletter')) return;
+    if (!isPrivateChat(from)) return;
 
     const { phone, profileName } = await resolvePhone(msg);
+
+    // Los asesores nunca son atendidos por Sofía: solo pueden enviar comandos.
+    if (ADVISOR_NUMBERS.includes(phone)) {
+      const body = (msg.body || '').trim();
+      if (body.startsWith('/')) await handleAdvisorCommand(msg, body);
+      return;
+    }
+
     if (ALLOWED_NUMBERS.length && !ALLOWED_NUMBERS.includes(phone)) return;
+
+    chatToPhone.set(from, phone);
+    phoneToChat.set(phone, from);
 
     let text = (msg.body || '').trim();
     if (msg.type !== 'chat' || !text) {
@@ -165,7 +350,7 @@ client.on('message', async (msg) => {
       }
     }
 
-    logger.info('Mensaje recibido', { phone, type: msg.type, text: text.slice(0, 200) });
+    logger.info('Mensaje recibido', { phone, type: msg.type, text: text.slice(0, 200), pausado: isPaused(phone) });
 
     let q = queues.get(from);
     if (!q) {
@@ -186,6 +371,33 @@ client.on('message', async (msg) => {
   }
 });
 
+// Mensajes salientes: si no los envió el bot, es un asesor escribiendo desde
+// este número (teléfono o WhatsApp Web) y Sofía se pausa en ese chat.
+client.on('message_create', async (msg) => {
+  try {
+    if (!msg.fromMe) return;
+    const to = msg.to || '';
+    if (!isPrivateChat(to)) return;
+    if (consumeBotEcho(to, msg.body)) return;
+
+    let phone = chatToPhone.get(to);
+    if (!phone) {
+      try {
+        const contact = await client.getContactById(to);
+        phone = (contact.number || '').replace(/\D/g, '');
+      } catch (_) {
+        phone = to.split('@')[0].replace(/\D/g, '');
+      }
+    }
+    if (!phone || ADVISOR_NUMBERS.includes(phone)) return;
+
+    pause(phone, TAKEOVER_MS, 'un asesor escribió desde el número del bot');
+    if (msg.body) ai.recordExternalMessage(phone, 'assistant', `[Mensaje del asesor humano] ${msg.body}`);
+  } catch (err) {
+    logger.error('Error en handler de message_create', { error: err.message, stack: err.stack });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Health-check HTTP
 // ---------------------------------------------------------------------------
@@ -202,6 +414,8 @@ app.get('/health', async (req, res) => {
     messagesProcessed: state.messagesProcessed,
     lastMessageAt: state.lastMessageAt,
     ai: ai.stats(),
+    advisors: ADVISOR_NUMBERS.length,
+    pausedChats: [...pausedUntil.keys()].filter(isPaused).length,
   };
   if (req.query.deep === '1') body.crm = await crm.healthCheck();
   res.status(healthy || state.whatsapp === 'waiting_qr' || state.whatsapp === 'starting' ? 200 : 503).json(body);
