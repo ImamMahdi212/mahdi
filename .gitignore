@@ -3,6 +3,7 @@ node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
 logs/
+data/
 *.log
 npm-debug.log*
 .DS_Store
